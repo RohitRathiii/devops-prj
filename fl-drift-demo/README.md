@@ -54,4 +54,4 @@ Key parameters in `pyproject.toml`:
 - Transformers + PyTorch: LLM implementation
 - Alibi Detect: Server-side drift detection
 - Evidently + River: Client-side drift detection
-- nlpaug: Synthetic drift injection
+- nlpaug: Synthetic drift injection# devops-prj
