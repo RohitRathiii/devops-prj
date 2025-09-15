@@ -22,9 +22,10 @@ except ImportError:
     ADWIN = None
     
 try:
-    from evidently.report import Report
-    from evidently.metric_preset import DataDriftPreset
-    from evidently import ColumnMapping
+    from evidently import Report
+    from evidently.presets import DataDriftPreset
+    # ColumnMapping is not available in this version, use None as fallback
+    ColumnMapping = None
 except ImportError:
     Report = None
     DataDriftPreset = None

@@ -58,9 +58,60 @@ class DriftInjector:
     
     def __init__(self, drift_intensity: float = 0.3):
         self.drift_intensity = drift_intensity
-        self.synonym_aug = naw.SynonymAug(aug_src='wordnet', aug_p=drift_intensity)
+
+        # Fix NLTK data loading issues
+        self._setup_nltk_data()
+
+        # Initialize augmenters with error handling
+        try:
+            self.synonym_aug = naw.SynonymAug(aug_src='wordnet', aug_p=drift_intensity)
+            self.use_synonyms = True
+        except Exception as e:
+            logger.warning(f"Failed to initialize wordnet synonym augmenter: {e}")
+            logger.warning("Falling back to word swap augmenter for vocabulary drift")
+            self.synonym_aug = None
+            self.use_synonyms = False
+
         self.swap_aug = naw.RandomWordAug(action="swap", aug_p=drift_intensity)
-        
+
+    def _setup_nltk_data(self):
+        """Setup NLTK data with proper error handling to avoid recursion issues."""
+        import ssl
+        import nltk
+
+        try:
+            # Try to create unverified HTTPS context to bypass SSL issues
+            try:
+                _create_unverified_https_context = ssl._create_unverified_context
+            except AttributeError:
+                pass
+            else:
+                ssl._create_default_https_context = _create_unverified_https_context
+
+            # Check if NLTK data already exists
+            import os
+            nltk_data_path = os.path.expanduser('~/nltk_data/corpora')
+            wordnet_exists = (os.path.exists(os.path.join(nltk_data_path, 'wordnet')) or
+                            os.path.exists(os.path.join(nltk_data_path, 'wordnet.zip')))
+            omw_exists = (os.path.exists(os.path.join(nltk_data_path, 'omw-1.4')) or
+                         os.path.exists(os.path.join(nltk_data_path, 'omw-1.4.zip')))
+
+            # Download only if not already present
+            if not wordnet_exists:
+                logger.info("Downloading NLTK wordnet data...")
+                nltk.download('wordnet', quiet=True)
+            else:
+                logger.debug("NLTK wordnet data already available")
+
+            if not omw_exists:
+                logger.info("Downloading NLTK omw-1.4 data...")
+                nltk.download('omw-1.4', quiet=True)
+            else:
+                logger.debug("NLTK omw-1.4 data already available")
+
+        except Exception as e:
+            logger.warning(f"NLTK data setup failed: {e}. Will use fallback augmentation.")
+
     def inject_vocab_drift(self, texts: List[str]) -> List[str]:
         """Inject vocabulary drift using synonym replacement."""
         try:

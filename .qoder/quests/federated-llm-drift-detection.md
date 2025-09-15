@@ -319,313 +319,243 @@ class DriftAwareStrategy(FedAvg):
         if server_round == 1:
             # Set reference embeddings from first round
             self.reference_embeddings = client_embeddings
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+            self.mmd_detector = MMDDrift(
+                self.reference_embeddings,
+                p_val=0.05
+            )
+        else:
+            # Test for drift
+            drift_result = self.mmd_detector.predict(client_embeddings)
+            global_drift = drift_result['data']['is_drift']
+            
+            if global_drift:
+                self.trigger_mitigation()
+        
+        return super().aggregate_evaluate(server_round, results, failures)
+```
+
+### Step 5: Automatic Mitigation Trigger & Recovery
+
+**Trigger Logic Implementation:**
+```python
+def should_trigger_mitigation(self, server_round, client_results):
+    # Global drift detection
+    global_drift = self.detect_global_drift()
+    
+    # Client quorum check
+    drift_reports = [r.metrics.get('adwin_drift', False) for _, r in client_results]
+    client_drift_ratio = sum(drift_reports) / len(drift_reports)
+    
+    # Trigger conditions
+    return (
+        global_drift or  # MMD test detects drift
+        client_drift_ratio > 0.3  # >30% clients report drift
+    )
+```
+
+**Recovery Strategy Implementation:**
+```python
+class AdaptiveStrategy(FedAvg):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mitigation_active = False
+        self.trimmed_strategy = FedTrimmedAvg(beta=0.2)
+    
+    def aggregate_fit(self, server_round, results, failures):
+        if self.mitigation_active:
+            # Use robust aggregation
+            return self.trimmed_strategy.aggregate_fit(server_round, results, failures)
+        else:
+            # Use standard FedAvg
+            return super().aggregate_fit(server_round, results, failures)
+```
+
+## Testing Strategy
+
+### Unit Testing Framework
+
+**Test Categories:**
+1. **Drift Detection Tests**
+   - ADWIN sensitivity validation
+   - MMD statistical power testing
+   - Evidently report generation verification
+
+2. **Mitigation Strategy Tests**
+   - FedTrimmedAvg convergence validation
+   - Client re-weighting accuracy tests
+   - Strategy switching logic verification
+
+3. **Integration Tests**
+   - End-to-end pipeline execution
+   - Multi-client simulation stability
+   - Performance metric collection validation
+
+**Test Implementation Structure:**
+```python
+class TestDriftDetection(unittest.TestCase):
+    def test_adwin_concept_drift(self):
+        # Validate ADWIN detects known concept changes
+        detector = ADWIN(delta=0.002)
+        # Feed stable then drifted data
+        # Assert drift detection
+    
+    def test_mmd_embedding_drift(self):
+        # Validate MMD detects embedding distribution changes
+        # Generate reference and drifted embedding sets
+        # Assert p-value < threshold
+    
+    def test_evidently_data_drift(self):
+        # Validate Evidently detects data distribution changes
+        # Generate reference and drifted datasets
+        # Assert PSI score exceeds threshold
+
+class TestMitigationStrategies(unittest.TestCase):
+    def test_fedtrimmedavg_robustness(self):
+        # Validate robust aggregation under drift
+        # Simulate clean and drifted client updates
+        # Assert improved convergence
+```
+
+### Evaluation Metrics & Experiment Design
+
+**Core Evaluation Metrics:**
+
+| Metric | Formula | Purpose | Target |
+|--------|---------|---------|--------|
+| Global Accuracy | `(ΣTP + ΣTN) / Total` | Overall performance | >85% |
+| Fairness Gap | `max(acc) - min(acc)` | Client disparity | <15% |
+| Detection Delay | `Round(detect) - Round(inject)` | Response time | ≤3 rounds |
+| Recovery Rate | `(Acc_recover - Acc_drift) / (Acc_base - Acc_drift)` | Mitigation effectiveness | ≥80% |
+| Communication Overhead | `Rounds × Bytes_per_update` | Efficiency | <2x baseline |
+
+**Experimental Protocol:**
+
+```mermaid
+gantt
+    title Federated Drift Detection Experiment Timeline
+    dateFormat X
+    axisFormat %d
+    
+    section Baseline
+    Stable Training (FedAvg)    :1, 9
+    
+    section Drift Injection
+    Data Drift Injection        :10, 10
+    
+    section Detection
+    Drift Detection Phase       :11, 13
+    
+    section Recovery
+    Mitigation Activation       :14, 25
+    
+    section Validation
+    Second Drift + Recovery     :26, 50
+```
+
+**Acceptance Criteria:**
+
+| Phase | Rounds | Criteria | Pass/Fail Threshold |
+|-------|--------|----------|-------------------|
+| Baseline | 1-9 | Stable accuracy | Acc > 80% |
+| Drift Impact | 10-13 | Performance drop | 5-15% accuracy loss |
+| Detection | 11-13 | Drift detection | p < 0.05 within 3 rounds |
+| Recovery | 14-25 | Accuracy restoration | ≥80% recovery within 10 rounds |
+| Re-detection | 27-29 | Second drift detection | p < 0.05 within 3 rounds |
+
+## Configuration Management
+
+### Environment Configuration
+
+**Development Environment:**
+```bash
+# Virtual environment setup
+python3 -m venv fl_env
+source fl_env/bin/activate
+
+# Core dependencies
+pip install flwr[simulation]==1.7.0
+pip install torch==2.1.0 torchvision torchaudio
+pip install transformers==4.35.0 datasets==2.14.0
+pip install alibi-detect==0.11.4 evidently==0.4.15
+pip install river==0.19.0 nlpaug==1.1.11
+```
+
+**Hardware Requirements:**
+- macOS 12.0+ (Intel or Apple Silicon)
+- 8GB RAM minimum, 16GB recommended
+- 10GB free disk space
+- Python 3.8-3.11
+
+### Simulation Configuration
+
+**Flower Simulation Settings:**
+```toml
+[tool.flwr.run.simulation]
+num_supernodes = 10
+num_rounds = 50
+num_cpus = 4
+num_gpus = 0.25  # MPS fraction for Apple Silicon
+
+[tool.flwr.run.simulation.client_resources]
+num_cpus = 2
+num_gpus = 0.1
+```
+
+**Model Configuration:**
+```python
+MODEL_CONFIG = {
+    'model_name': 'prajjwal1/bert-tiny',
+    'max_length': 128,
+    'batch_size': 16,
+    'learning_rate': 2e-5,
+    'num_epochs': 3,
+    'warmup_steps': 100
+}
+
+DRIFT_CONFIG = {
+    'injection_round': 25,
+    'drift_intensity': 0.3,
+    'affected_clients': [2, 5, 8],
+    'drift_types': ['vocab_shift', 'label_noise']
+}
+```
+
+### Logging and Monitoring
+
+**Metrics Collection:**
+```python
+METRICS_CONFIG = {
+    'log_file': 'drift_detection_results.csv',
+    'metrics_to_track': [
+        'global_accuracy',
+        'fairness_gap',
+        'drift_detection_rate',
+        'recovery_effectiveness',
+        'communication_overhead'
+    ],
+    'visualization': True,
+    'real_time_plotting': False
+}
+```
+
+**Output Structure:**
+```
+fl-drift-demo/
+├── results/
+│   ├── metrics_log.csv
+│   ├── drift_detection_timeline.json
+│   └── plots/
+│       ├── accuracy_over_time.png
+│       ├── fairness_gap_evolution.png
+│       └── drift_detection_heatmap.png
+├── logs/
+│   ├── server.log
+│   └── client_*.log
+└── checkpoints/
+    ├── round_10_baseline.pth
+    ├── round_25_post_drift.pth
+    └── round_50_recovered.pth
+```
 
 
 

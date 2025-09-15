@@ -137,47 +137,61 @@ class FederatedDriftSimulation:
     
     def create_client_fn(self) -> Callable[[str], Any]:
         """Create client factory function for simulation."""
+        # Extract values to avoid capturing 'self' in closure
+        model_config = self.config['model'].copy()
+        drift_config = self.config['drift_detection'].copy()
+        device = self.device
+        client_datasets = self.client_datasets
+        test_dataset = self.test_dataset
+
         def client_fn(context: Context) -> Any:
             """Create a client for the given context."""
-            # Extract client ID from context
-            client_id = context.node_id
-            
+            # Extract client ID from context - Ray generates random node IDs
+            ray_node_id = context.node_id
+
+            # Map Ray's node_id to our sequential client indices
+            # Convert the large Ray ID to a client index within our range
+            client_idx = int(ray_node_id) % len(client_datasets)
+
+            print(f"[CLIENT] Ray node_id: {ray_node_id} → mapped to client_idx: {client_idx}")
+
             # Create model for this client
-            model, _ = create_model(self.config['model'], self.device)
-            
-            # Get client's data
-            if int(client_id) in self.client_datasets:
-                train_dataset = self.client_datasets[int(client_id)]
-                
+            model, _ = create_model(model_config, device)
+
+            # Get client's data using the mapped index
+            if client_idx in client_datasets:
+                train_dataset = client_datasets[client_idx]
+
                 # Create data loaders
                 train_loader = torch.utils.data.DataLoader(
                     train_dataset,
-                    batch_size=self.config['model']['batch_size'],
+                    batch_size=model_config['batch_size'],
                     shuffle=True,
                     drop_last=True
                 )
-                
+
                 test_loader = torch.utils.data.DataLoader(
-                    self.test_dataset,
-                    batch_size=self.config['model']['batch_size'],
+                    test_dataset,
+                    batch_size=model_config['batch_size'],
                     shuffle=False
                 )
-                
+
                 # Create drift detection client
-                client = create_drift_detection_client(
-                    client_id=client_id,
+                numpy_client = create_drift_detection_client(
+                    client_id=str(client_idx),  # Use mapped index as client ID
                     model=model,
                     train_loader=train_loader,
                     test_loader=test_loader,
-                    device=self.device,
-                    drift_config=self.config['drift_detection']
+                    device=device,
+                    drift_config=drift_config
                 )
-                
-                return client
+
+                # Convert NumPyClient to Client (recommended by Flower)
+                return numpy_client.to_client()
             else:
-                logger.error(f"No dataset found for client {client_id}")
+                print(f"[ERROR] No dataset found for client_idx {client_idx}")
                 return None
-        
+
         return client_fn
     
     def create_strategy(self) -> Any:
@@ -198,16 +212,57 @@ class FederatedDriftSimulation:
         
         # Create client function with drift injection logic
         original_client_fn = self.create_client_fn()
-        
+
+        # Extract drift injection parameters to avoid capturing 'self'
+        drift_injection_round = self.drift_injection_round
+        affected_clients = self.config['drift']['affected_clients']
+        drift_types = self.config['drift']['drift_types']
+        drift_intensity = self.config['drift']['drift_intensity']
+        client_datasets = self.client_datasets
+
+        # Use a mutable container to track drift injection state
+        drift_state = {'injected': False}
+
         def client_fn_with_drift(context: Context) -> Any:
             # Check if we should inject drift
             current_round = getattr(context, 'round', 0)
-            
-            if (current_round == self.drift_injection_round and 
-                not hasattr(self, '_drift_injected')):
-                self.inject_drift()
-                self._drift_injected = True
-            
+
+            if (current_round == drift_injection_round and not drift_state['injected']):
+                print(f"[DRIFT] Injecting drift at round {drift_injection_round}...")
+
+                # Apply drift directly without using data_loader object
+                for client_id in affected_clients:
+                    if client_id not in client_datasets:
+                        continue
+
+                    original_dataset = client_datasets[client_id]
+                    texts = original_dataset.texts.copy()
+                    labels = original_dataset.labels.copy()
+
+                    # Simple drift injection (label noise only to avoid NLTK dependency)
+                    if 'label_noise' in drift_types:
+                        import numpy as np
+                        num_samples = len(labels)
+                        num_to_flip = int(num_samples * 0.2)  # 20% noise rate
+                        indices_to_flip = np.random.choice(num_samples, num_to_flip, replace=False)
+
+                        for idx in indices_to_flip:
+                            original_label = labels[idx]
+                            possible_labels = [i for i in range(4) if i != original_label]
+                            labels[idx] = np.random.choice(possible_labels)
+
+                    # Create new drifted dataset
+                    from fed_drift.data import AGNewsDataset
+                    drifted_dataset = AGNewsDataset(
+                        texts=texts,
+                        labels=labels,
+                        tokenizer=original_dataset.tokenizer
+                    )
+                    client_datasets[client_id] = drifted_dataset
+
+                print(f"[DRIFT] Applied drift types {drift_types} to clients {affected_clients}")
+                drift_state['injected'] = True
+
             return original_client_fn(context)
         
         # Create strategy
@@ -220,14 +275,16 @@ class FederatedDriftSimulation:
         }
         
         try:
+            # Create proper Flower config with num_rounds
+            config = fl.server.ServerConfig(num_rounds=self.num_rounds)
+
             # Run simulation
             history = start_simulation(
                 client_fn=client_fn_with_drift,
                 num_clients=self.num_clients,
-                config=fl.common.Config(),
+                config=config,
                 strategy=strategy,
                 client_resources={"num_cpus": 1, "num_gpus": 0.0},
-                backend_config=simulation_config['backend_config'],
                 ray_init_args=simulation_config['ray_init_args']
             )
             

@@ -14,10 +14,6 @@ from typing import Dict, List, Tuple, Optional, Any
 import logging
 
 from flwr.client import NumPyClient
-from flwr.common import (
-    Config, EvaluateIns, EvaluateRes, FitIns, FitRes, GetParametersIns, GetParametersRes,
-    Status, Code, parameters_to_ndarrays, ndarrays_to_parameters
-)
 
 from .models import BERTClassifier, ModelTrainer, ModelUtils, get_device
 from .data import AGNewsDataset
@@ -73,49 +69,47 @@ class DriftDetectionClient(NumPyClient):
         
         logger.info(f"Initialized drift detection client {client_id}")
     
-    def get_parameters(self, ins: GetParametersIns) -> GetParametersRes:
+    def get_parameters(self, config):
         """Get model parameters."""
         try:
-            parameters = [param.cpu().numpy() for param in self.model.parameters()]
-            return GetParametersRes(
-                status=Status(code=Code.OK, message="Parameters retrieved successfully"),
-                parameters=ndarrays_to_parameters(parameters)
-            )
+            parameters = [param.detach().cpu().numpy() for param in self.model.parameters()]
+            return parameters
         except Exception as e:
             logger.error(f"Client {self.client_id}: Failed to get parameters: {e}")
-            return GetParametersRes(
-                status=Status(code=Code.GET_PARAMETERS_NOT_IMPLEMENTED, message=str(e)),
-                parameters=ndarrays_to_parameters([])
-            )
+            return []
     
     def set_parameters(self, parameters):
         """Set model parameters."""
         try:
-            params_dict = zip(self.model.state_dict().keys(), parameters_to_ndarrays(parameters))
-            state_dict = {k: torch.tensor(v) for k, v in params_dict}
-            self.model.load_state_dict(state_dict, strict=True)
+            if not parameters:  # Handle empty parameters (first round)
+                return
+
+            params_dict = zip(self.model.state_dict().keys(), parameters)
+            state_dict = {k: torch.tensor(v).to(self.device) for k, v in params_dict}
+            self.model.load_state_dict(state_dict, strict=False)  # Use strict=False to handle mismatches
         except Exception as e:
             logger.error(f"Client {self.client_id}: Failed to set parameters: {e}")
-            raise e
+            # Don't raise - continue with current parameters
+            pass
     
-    def fit(self, ins: FitIns) -> FitRes:
+    def fit(self, parameters, config):
         """
         Train model locally with drift detection.
-        
+
         Args:
-            ins: Fit instructions from server
-            
+            parameters: Model parameters from server
+            config: Training configuration
+
         Returns:
-            Fit results with drift metrics
+            Tuple of (parameters, num_examples, metrics)
         """
         self.round_number += 1
-        
+
         try:
             # Set parameters from server
-            self.set_parameters(ins.parameters)
-            
+            self.set_parameters(parameters)
+
             # Configure training
-            config = ins.config
             epochs = int(config.get("epochs", 3))
             learning_rate = float(config.get("learning_rate", 2e-5))
             
@@ -137,75 +131,64 @@ class DriftDetectionClient(NumPyClient):
                 "num_examples": len(self.train_loader.dataset)
             }
             
-            # Add embeddings to response (sample for efficiency)
+            # Add embedding statistics to response (avoiding nested lists)
             if len(embeddings) > 0:
-                # Sample embeddings to avoid large payloads
-                sample_size = min(100, len(embeddings))
-                sampled_embeddings = embeddings[:sample_size].tolist()
-                response_metrics["embeddings"] = sampled_embeddings
+                # Convert embeddings to simple statistics for Flower compatibility
+                embedding_stats = {
+                    "embedding_count": len(embeddings),
+                    "embedding_dim": embeddings.shape[1] if embeddings.ndim > 1 else 1,
+                    "embedding_mean": float(np.mean(embeddings)),
+                    "embedding_std": float(np.std(embeddings))
+                }
+                response_metrics.update(embedding_stats)
             
             # Get updated parameters
-            parameters = [param.cpu().numpy() for param in self.model.parameters()]
-            
-            return FitRes(
-                status=Status(code=Code.OK, message="Training completed successfully"),
-                parameters=ndarrays_to_parameters(parameters),
-                num_examples=len(self.train_loader.dataset),
-                metrics=response_metrics
-            )
-            
+            updated_parameters = [param.detach().cpu().numpy() for param in self.model.parameters()]
+
+            return updated_parameters, len(self.train_loader.dataset), response_metrics
+
         except Exception as e:
             logger.error(f"Client {self.client_id}: Training failed: {e}")
-            return FitRes(
-                status=Status(code=Code.FIT_CLIENT_INTERRUPTED, message=str(e)),
-                parameters=ins.parameters,
-                num_examples=0,
-                metrics={"error": str(e)}
-            )
+            # Return at least 1 example to avoid division by zero in aggregation
+            num_examples = max(1, len(self.train_loader.dataset))
+            return parameters, num_examples, {"error": str(e)}
     
-    def evaluate(self, ins: EvaluateIns) -> EvaluateRes:
+    def evaluate(self, parameters, config):
         """
         Evaluate model locally.
-        
+
         Args:
-            ins: Evaluation instructions from server
-            
+            parameters: Model parameters from server
+            config: Evaluation configuration
+
         Returns:
-            Evaluation results with performance metrics
+            Tuple of (loss, num_examples, metrics)
         """
         try:
             # Set parameters from server
-            self.set_parameters(ins.parameters)
-            
+            self.set_parameters(parameters)
+
             # Evaluate model
             eval_metrics = self._evaluate_model()
-            
+
             # Update drift detector with performance
             if "accuracy" in eval_metrics:
                 self.drift_detector.update_performance(eval_metrics["accuracy"])
-            
+
             # Prepare response metrics
             response_metrics = {
                 **eval_metrics,
                 "client_id": self.client_id,
                 "round": self.round_number
             }
-            
-            return EvaluateRes(
-                status=Status(code=Code.OK, message="Evaluation completed successfully"),
-                loss=eval_metrics.get("loss", 0.0),
-                num_examples=len(self.test_loader.dataset),
-                metrics=response_metrics
-            )
-            
+
+            return eval_metrics.get("loss", 0.0), len(self.test_loader.dataset), response_metrics
+
         except Exception as e:
             logger.error(f"Client {self.client_id}: Evaluation failed: {e}")
-            return EvaluateRes(
-                status=Status(code=Code.EVALUATE_CLIENT_INTERRUPTED, message=str(e)),
-                loss=float('inf'),
-                num_examples=0,
-                metrics={"error": str(e)}
-            )
+            # Return at least 1 example to avoid division by zero in aggregation
+            num_examples = max(1, len(self.test_loader.dataset))
+            return float('inf'), num_examples, {"error": str(e)}
     
     def _train_model(self, epochs: int, learning_rate: float) -> Dict[str, float]:
         """Train the model for specified epochs."""

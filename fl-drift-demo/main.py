@@ -167,19 +167,25 @@ Examples:
             print("\n" + "="*60)
             print("🎯 SIMULATION COMPLETED SUCCESSFULLY")
             print("="*60)
-            
+
+            # Helper function to format numeric values
+            def format_metric(value):
+                if isinstance(value, (int, float)):
+                    return f"{value:.4f}"
+                return str(value)
+
             if 'performance_metrics' in results:
                 metrics = results['performance_metrics']
-                print(f"📊 Final Global Accuracy: {metrics.get('final_accuracy', 'N/A'):.4f}")
-                print(f"📈 Peak Accuracy: {metrics.get('peak_accuracy', 'N/A'):.4f}")
-                print(f"⚖️  Fairness Gap: {metrics.get('final_fairness_gap', 'N/A'):.4f}")
-                
+                print(f"📊 Final Global Accuracy: {format_metric(metrics.get('final_accuracy', 'N/A'))}")
+                print(f"📈 Peak Accuracy: {format_metric(metrics.get('peak_accuracy', 'N/A'))}")
+                print(f"⚖️  Fairness Gap: {format_metric(metrics.get('final_fairness_gap', 'N/A'))}")
+
                 if 'accuracy_recovery_rate' in metrics:
-                    print(f"🔄 Recovery Rate: {metrics['accuracy_recovery_rate']:.4f}")
-            
+                    print(f"🔄 Recovery Rate: {format_metric(metrics['accuracy_recovery_rate'])}")
+
             if 'drift_summary' in results:
                 drift_summary = results['drift_summary']
-                print(f"🔍 Drift Detection Rate: {drift_summary.get('drift_detection_rate', 'N/A'):.4f}")
+                print(f"🔍 Drift Detection Rate: {format_metric(drift_summary.get('drift_detection_rate', 'N/A'))}")
                 print(f"🛡️  Mitigation Activated: {drift_summary.get('mitigation_activated', 'N/A')}")
             
             print(f"💾 Results saved to: results/simulation_{results['simulation_id']}.json")

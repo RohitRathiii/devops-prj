@@ -1,0 +1,83 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+fl_env/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# PyTorch
+*.pth
+*.pt
+checkpoints/
+models/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Results and logs
+results/
+logs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+
+# Data files (large datasets)
+data/
+datasets/
+*.csv
+*.json
+*.txt
+
+# Images and documentation artifacts
+*.jpeg
+*.jpg
+*.png
+*.pdf
+
+# Ray/Flower temporary files
+ray_results/
+flower_logs/

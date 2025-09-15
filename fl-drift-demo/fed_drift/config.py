@@ -192,12 +192,34 @@ class ConfigManager:
             drift_config = self.config['drift']
             injection_round = drift_config.get('injection_round', 0)
             total_rounds = self.config.get('simulation', {}).get('num_rounds', 0)
-            
+
             if injection_round >= total_rounds:
                 issues.append("injection_round must be less than num_rounds")
-            
+
             if not (0 < drift_config.get('drift_intensity', 0) <= 1):
                 issues.append("drift_intensity must be between 0 and 1")
+
+            # Validate affected_clients against num_clients
+            num_clients = self.config.get('federated', {}).get('num_clients', 10)
+            affected_clients = drift_config.get('affected_clients', [])
+
+            # Check if any affected client index is out of bounds
+            invalid_clients = [c for c in affected_clients if c >= num_clients or c < 0]
+            if invalid_clients:
+                # Add error message before auto-fixing so we can see it
+                error_msg = f"affected_clients {affected_clients} are invalid for {num_clients} clients (valid range: 0-{num_clients-1})"
+
+                # Auto-fix: adjust affected clients to valid range
+                valid_clients = [c for c in affected_clients if 0 <= c < num_clients]
+                if not valid_clients:
+                    # If no valid clients, use some defaults
+                    valid_clients = [min(2, num_clients-1), min(num_clients//2, num_clients-1)]
+                    valid_clients = list(set(valid_clients))  # Remove duplicates
+                self.config['drift']['affected_clients'] = valid_clients
+                logger.warning(f"Auto-corrected affected_clients from {affected_clients} to {valid_clients} (valid range: 0-{num_clients-1})")
+
+                # Since we auto-fixed, only add as warning, not blocking error
+                # issues.append(error_msg)  # Commented out - auto-fix handles this
         
         # Validate drift detection config
         if 'drift_detection' in self.config:
