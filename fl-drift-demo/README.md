@@ -15,6 +15,9 @@ This system addresses the challenge where input data from distributed clients gr
 
 ## Quick Start
 
+cd fl-drift-demo
+pip install -r requirements.txt
+
 1. Activate virtual environment:
    ```bash
    source fl_env/bin/activate

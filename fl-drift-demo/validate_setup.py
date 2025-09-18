@@ -34,7 +34,7 @@ def test_imports():
         logger.info("✓ River (ADWIN) imported successfully")
         
         try:
-            from evidently.report import Report
+            from evidently import Report
             logger.info("✓ Evidently imported successfully")
         except ImportError as e:
             logger.warning(f"Evidently import issue: {e}")
