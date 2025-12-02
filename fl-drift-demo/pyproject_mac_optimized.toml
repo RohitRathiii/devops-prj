@@ -1,0 +1,61 @@
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
+name = "fl-drift-demo"
+version = "0.1.0"
+description = "Federated LLM Drift Detection and Recovery System"
+authors = [{name = "Rohit", email = "rohitrathi.in@gmail.com"}]
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "flwr[simulation]>=1.20.0",
+    "transformers[torch]>=4.56.0",
+    "datasets>=4.0.0",
+    "torch>=2.8.0",
+    "alibi-detect>=0.12.0",
+    "evidently>=0.7.14",
+    "river>=0.22.0",
+    "nlpaug>=1.1.11",
+    "scikit-learn>=1.7.0"
+]
+
+[tool.poetry]
+name = "fl-drift-demo"
+version = "0.1.0"
+description = "Federated LLM Drift Detection and Recovery System"
+authors = ["User <user@example.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.8"
+flwr = {extras = ["simulation"], version = "^1.20.0"}
+transformers = {extras = ["torch"], version = "^4.56.0"}
+datasets = "^4.0.0"
+torch = "^2.8.0"
+torchvision = "^0.23.0"
+torchaudio = "^2.8.0"
+alibi-detect = "^0.12.0"
+evidently = "^0.7.14"
+river = "^0.22.0"
+nlpaug = "^1.1.11"
+scikit-learn = "^1.7.0"
+
+# Mac-Optimized Configuration for Apple Silicon
+[tool.flwr.run.simulation]
+num_supernodes = 3           # Reduced from 10 to 3
+num_rounds = 10              # Reduced from 50 to 10 for testing
+num_cpus = 2                 # Reduced from 4 to 2
+num_gpus = 0.1               # Reduced from 0.25 to 0.1
+
+[tool.flwr.run.simulation.client_resources]
+num_cpus = 1                 # Reduced from 2 to 1 per client
+num_gpus = 0.05              # Reduced from 0.1 to 0.05 per client
+
+[tool.flwr.app]
+publisher = "user"
+
+[tool.flwr.app.components]
+serverapp = "fed_drift.simulation:app"
+clientapp = "fed_drift.client:app"

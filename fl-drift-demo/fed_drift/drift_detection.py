@@ -36,6 +36,8 @@ try:
 except ImportError:
     MMDDrift = None
 
+from .metrics_utils import calculate_confusion_matrix_metrics
+
 logger = logging.getLogger(__name__)
 
 
@@ -214,14 +216,50 @@ class MMDDriftDetector(DriftDetector):
         self.reference_embeddings = reference_embeddings
         
         try:
+            # Try PyTorch backend first (recommended for this project)
             self.detector = MMDDrift(
-                X_ref=reference_embeddings,
+                x_ref=reference_embeddings,
+                backend='pytorch',  # Use PyTorch backend instead of TensorFlow
                 p_val=self.p_val,
                 n_permutations=self.n_permutations
             )
-        except Exception as e:
-            logger.warning(f"Failed to initialize MMD detector: {e}")
-            self.detector = None
+            logger.info("MMD detector initialized with PyTorch backend")
+        except Exception as e1:
+            try:
+                # Fallback to TensorFlow backend (if available)
+                self.detector = MMDDrift(
+                    x_ref=reference_embeddings,
+                    backend='tensorflow',
+                    p_val=self.p_val,
+                    n_permutations=self.n_permutations
+                )
+                logger.info("MMD detector initialized with TensorFlow backend")
+            except Exception as e2:
+                try:
+                    # Try legacy API without backend specification
+                    self.detector = MMDDrift(
+                        X_ref=reference_embeddings,  # Legacy parameter name
+                        p_val=self.p_val,
+                        n_permutations=self.n_permutations
+                    )
+                    logger.info("MMD detector initialized with legacy API")
+                except Exception as e3:
+                    try:
+                        # Final fallback - no backend, manual reference setting
+                        self.detector = MMDDrift(
+                            p_val=self.p_val,
+                            n_permutations=self.n_permutations
+                        )
+                        # Set reference manually
+                        if hasattr(self.detector, 'x_ref'):
+                            self.detector.x_ref = reference_embeddings
+                        elif hasattr(self.detector, 'X_ref'):
+                            self.detector.X_ref = reference_embeddings
+                        logger.info("MMD detector initialized with manual reference setting")
+                    except Exception as e4:
+                        logger.error(f"All MMD initialization methods failed: {e1}, {e2}, {e3}, {e4}")
+                        logger.warning("Disabling MMD drift detection - using placeholder")
+                        self.detector = None
     
     def update(self, embeddings: np.ndarray) -> None:
         """Update with new embedding data."""
@@ -372,34 +410,153 @@ class MultiLevelDriftDetector:
 
 
 # Utility functions for drift analysis
-def calculate_drift_metrics(drift_history: List[Dict[str, DriftResult]], 
+def calculate_drift_metrics(drift_history: List[Dict[str, DriftResult]],
                           injection_round: int) -> Dict[str, float]:
-    """Calculate drift detection metrics."""
+    """
+    Calculate comprehensive drift detection metrics including confusion matrix.
+
+    Computes precision, recall, F1 score, FPR, FNR, and traditional metrics
+    (detection delay, detection rate) for each detector type.
+
+    Ground Truth Definition:
+        - Rounds < injection_round: No drift (negative class)
+        - Rounds >= injection_round: Drift present (positive class)
+
+    Args:
+        drift_history: List of drift detection results per round
+        injection_round: Round when drift was injected
+
+    Returns:
+        Dictionary with comprehensive metrics per detector type
+
+    Metrics Calculated (per detector):
+        - Detection delay: Rounds until first detection after injection
+        - Detection rate: % of rounds with drift detected post-injection
+        - True Positives (TP): Drift correctly detected
+        - False Positives (FP): Drift incorrectly detected (pre-injection)
+        - True Negatives (TN): No drift correctly detected (pre-injection)
+        - False Negatives (FN): Drift missed (post-injection)
+        - Precision: TP / (TP + FP)
+        - Recall: TP / (TP + FN)
+        - F1 Score: Harmonic mean of precision and recall
+        - False Positive Rate (FPR): FP / (FP + TN)
+        - False Negative Rate (FNR): FN / (FN + TP)
+    """
     if not drift_history:
+        logger.warning("calculate_drift_metrics: Empty drift_history")
         return {}
-    
+
     metrics = {}
-    
+
+    # Process each detector type
     for detector_type in drift_history[0].keys():
-        # Extract drift signals for this detector
-        drift_signals = [round_results[detector_type].is_drift for round_results in drift_history]
-        
+        # Extract drift signals for this detector across all rounds
+        drift_signals = [
+            round_results[detector_type].is_drift
+            for round_results in drift_history
+        ]
+
+        # === Traditional Metrics ===
+
         # Detection delay (rounds until first detection after injection)
         detection_round = None
         for round_idx, is_drift in enumerate(drift_signals):
             if is_drift and round_idx >= injection_round:
                 detection_round = round_idx
                 break
-        
-        detection_delay = detection_round - injection_round if detection_round else len(drift_signals)
-        
+
+        detection_delay = (
+            detection_round - injection_round
+            if detection_round is not None
+            else len(drift_signals) - injection_round
+        )
+
         # Detection rate (percentage of rounds with drift detected after injection)
         post_injection_signals = drift_signals[injection_round:]
-        detection_rate = sum(post_injection_signals) / len(post_injection_signals) if post_injection_signals else 0.0
-        
+        detection_rate = (
+            sum(post_injection_signals) / len(post_injection_signals)
+            if post_injection_signals
+            else 0.0
+        )
+
+        # === Confusion Matrix Metrics ===
+
+        # Define ground truth:
+        # - Pre-injection (rounds < injection_round): No drift (negative)
+        # - Post-injection (rounds >= injection_round): Drift present (positive)
+
+        true_positives = 0
+        false_positives = 0
+        true_negatives = 0
+        false_negatives = 0
+
+        for round_idx, detected_drift in enumerate(drift_signals):
+            is_post_injection = round_idx >= injection_round
+
+            if is_post_injection:
+                # Ground truth: drift exists
+                if detected_drift:
+                    true_positives += 1
+                else:
+                    false_negatives += 1
+            else:
+                # Ground truth: no drift
+                if detected_drift:
+                    false_positives += 1
+                else:
+                    true_negatives += 1
+
+        # Calculate confusion matrix derived metrics
+        cm_metrics = calculate_confusion_matrix_metrics(
+            true_positives=true_positives,
+            false_positives=false_positives,
+            true_negatives=true_negatives,
+            false_negatives=false_negatives
+        )
+
+        # === Aggregate All Metrics ===
+
         metrics[f"{detector_type}_detection_delay"] = detection_delay
         metrics[f"{detector_type}_detection_rate"] = detection_rate
-    
+        metrics[f"{detector_type}_true_positives"] = true_positives
+        metrics[f"{detector_type}_false_positives"] = false_positives
+        metrics[f"{detector_type}_true_negatives"] = true_negatives
+        metrics[f"{detector_type}_false_negatives"] = false_negatives
+        metrics[f"{detector_type}_precision"] = cm_metrics['precision']
+        metrics[f"{detector_type}_recall"] = cm_metrics['recall']
+        metrics[f"{detector_type}_f1"] = cm_metrics['f1']
+        metrics[f"{detector_type}_false_positive_rate"] = cm_metrics['false_positive_rate']
+        metrics[f"{detector_type}_false_negative_rate"] = cm_metrics['false_negative_rate']
+
+        logger.debug(
+            f"Drift metrics for {detector_type}: "
+            f"Precision={cm_metrics['precision']:.3f}, "
+            f"Recall={cm_metrics['recall']:.3f}, "
+            f"F1={cm_metrics['f1']:.3f}, "
+            f"FPR={cm_metrics['false_positive_rate']:.3f}, "
+            f"FNR={cm_metrics['false_negative_rate']:.3f}"
+        )
+
+    # Calculate aggregate metrics across all detectors
+    if len(drift_history[0].keys()) > 1:
+        total_tp = sum(metrics.get(f"{dt}_true_positives", 0) for dt in drift_history[0].keys())
+        total_fp = sum(metrics.get(f"{dt}_false_positives", 0) for dt in drift_history[0].keys())
+        total_tn = sum(metrics.get(f"{dt}_true_negatives", 0) for dt in drift_history[0].keys())
+        total_fn = sum(metrics.get(f"{dt}_false_negatives", 0) for dt in drift_history[0].keys())
+
+        aggregate_cm_metrics = calculate_confusion_matrix_metrics(
+            true_positives=total_tp,
+            false_positives=total_fp,
+            true_negatives=total_tn,
+            false_negatives=total_fn
+        )
+
+        metrics['aggregate_precision'] = aggregate_cm_metrics['precision']
+        metrics['aggregate_recall'] = aggregate_cm_metrics['recall']
+        metrics['aggregate_f1'] = aggregate_cm_metrics['f1']
+        metrics['aggregate_false_positive_rate'] = aggregate_cm_metrics['false_positive_rate']
+        metrics['aggregate_false_negative_rate'] = aggregate_cm_metrics['false_negative_rate']
+
     return metrics
 
 

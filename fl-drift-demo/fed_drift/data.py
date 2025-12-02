@@ -371,6 +371,29 @@ class FederatedDataLoader:
             stats['label_distributions'][client_id] = label_counts
         
         return stats
+    
+    def load_federated_data(self, num_clients: int, alpha: float = 0.5) -> Tuple[Dict[int, AGNewsDataset], AGNewsDataset, Dict[str, Any]]:
+        """
+        Load and partition federated data - compatibility method.
+        
+        Args:
+            num_clients: Number of federated clients
+            alpha: Dirichlet concentration parameter
+            
+        Returns:
+            Tuple of (client_datasets, test_dataset, statistics)
+        """
+        # Update configuration
+        self.num_clients = num_clients
+        self.alpha = alpha
+        
+        # Create federated splits
+        client_datasets, test_dataset = self.create_federated_splits()
+        
+        # Get statistics
+        stats = self.get_dataset_statistics(client_datasets)
+        
+        return client_datasets, test_dataset, stats
 
 
 # Configuration constants

@@ -67,6 +67,9 @@ class DriftDetectionClient(NumPyClient):
         self.performance_history = []
         self.drift_detection_history = []
         
+        # Embeddings storage for server retrieval
+        self.current_embeddings = np.array([])
+        
         logger.info(f"Initialized drift detection client {client_id}")
     
     def get_parameters(self, config):
@@ -79,18 +82,32 @@ class DriftDetectionClient(NumPyClient):
             return []
     
     def set_parameters(self, parameters):
-        """Set model parameters."""
+        """Set model parameters with validation."""
         try:
             if not parameters:  # Handle empty parameters (first round)
+                logger.info(f"Client {self.client_id}: Received empty parameters (initial round)")
                 return
 
+            # Calculate parameter checksum before setting
+            old_checksum = sum(torch.sum(p).item() for p in self.model.parameters())
+            
             params_dict = zip(self.model.state_dict().keys(), parameters)
             state_dict = {k: torch.tensor(v).to(self.device) for k, v in params_dict}
             self.model.load_state_dict(state_dict, strict=False)  # Use strict=False to handle mismatches
+            
+            # Calculate parameter checksum after setting
+            new_checksum = sum(torch.sum(p).item() for p in self.model.parameters())
+            
+            if abs(old_checksum - new_checksum) < 1e-6:
+                logger.warning(f"Client {self.client_id}: Model parameters unchanged after setting (checksum: {old_checksum:.6f})")
+            else:
+                logger.info(f"Client {self.client_id}: Model parameters updated (checksum: {old_checksum:.6f} → {new_checksum:.6f})")
+                
         except Exception as e:
             logger.error(f"Client {self.client_id}: Failed to set parameters: {e}")
+            import traceback
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
             # Don't raise - continue with current parameters
-            pass
     
     def fit(self, parameters, config):
         """
@@ -131,16 +148,24 @@ class DriftDetectionClient(NumPyClient):
                 "num_examples": len(self.train_loader.dataset)
             }
             
-            # Add embedding statistics to response (avoiding nested lists)
+            # Add embeddings transmission fix for Flower ConfigRecord TypeError
             if len(embeddings) > 0:
-                # Convert embeddings to simple statistics for Flower compatibility
+                # Fix: Use flattened embeddings or alternative transmission method
+                # Flower ConfigRecord can't handle nested lists - use simple statistics instead
                 embedding_stats = {
                     "embedding_count": len(embeddings),
                     "embedding_dim": embeddings.shape[1] if embeddings.ndim > 1 else 1,
                     "embedding_mean": float(np.mean(embeddings)),
-                    "embedding_std": float(np.std(embeddings))
+                    "embedding_std": float(np.std(embeddings)),
+                    "embedding_sample": embeddings[0].tolist() if len(embeddings) > 0 else []  # Send first embedding as sample
                 }
                 response_metrics.update(embedding_stats)
+                
+                # Store embeddings in client for later server retrieval (alternative approach)
+                self.current_embeddings = embeddings
+            else:
+                response_metrics["embedding_count"] = 0
+                self.current_embeddings = np.array([])
             
             # Get updated parameters
             updated_parameters = [param.detach().cpu().numpy() for param in self.model.parameters()]
@@ -171,9 +196,13 @@ class DriftDetectionClient(NumPyClient):
             # Evaluate model
             eval_metrics = self._evaluate_model()
 
-            # Update drift detector with performance
-            if "accuracy" in eval_metrics:
-                self.drift_detector.update_performance(eval_metrics["accuracy"])
+            # Update drift detector with performance (fix ADWIN API)
+            if "accuracy" in eval_metrics and hasattr(self.drift_detector, 'adwin_detector'):
+                # ADWIN expects individual performance values, not a method call
+                try:
+                    self.drift_detector.adwin_detector.update(eval_metrics["accuracy"])
+                except Exception as e:
+                    logger.debug(f"Client {self.client_id}: ADWIN update failed: {e}")
 
             # Prepare response metrics
             response_metrics = {
@@ -191,7 +220,11 @@ class DriftDetectionClient(NumPyClient):
             return float('inf'), num_examples, {"error": str(e)}
     
     def _train_model(self, epochs: int, learning_rate: float) -> Dict[str, float]:
-        """Train the model for specified epochs."""
+        """Train the model for specified epochs with enhanced debugging."""
+        # Calculate initial model checksum
+        initial_checksum = sum(torch.sum(p).item() for p in self.model.parameters())
+        logger.info(f"Client {self.client_id}: Starting training with {len(self.train_loader)} batches, LR={learning_rate}, initial checksum={initial_checksum:.6f}")
+        
         # Create optimizer
         optimizer = ModelUtils.create_optimizer(self.model, learning_rate)
         
@@ -207,12 +240,22 @@ class DriftDetectionClient(NumPyClient):
             epoch_accuracy = 0.0
             epoch_batches = 0
             
-            for batch in self.train_loader:
-                metrics = self.trainer.train_step(batch, optimizer)
-                
-                epoch_loss += metrics['loss']
-                epoch_accuracy += metrics['accuracy']
-                epoch_batches += 1
+            for batch_idx, batch in enumerate(self.train_loader):
+                try:
+                    metrics = self.trainer.train_step(batch, optimizer)
+                    
+                    epoch_loss += metrics['loss']
+                    epoch_accuracy += metrics['accuracy']
+                    epoch_batches += 1
+                    
+                    # Log first few batches for debugging
+                    if batch_idx < 3:
+                        logger.debug(f"Client {self.client_id}, Epoch {epoch + 1}, Batch {batch_idx + 1}: "
+                                   f"Loss={metrics['loss']:.4f}, Accuracy={metrics['accuracy']:.4f}")
+                        
+                except Exception as e:
+                    logger.error(f"Client {self.client_id}: Training step failed on batch {batch_idx}: {e}")
+                    continue
             
             if epoch_batches > 0:
                 epoch_loss /= epoch_batches
@@ -222,17 +265,25 @@ class DriftDetectionClient(NumPyClient):
                 total_accuracy += epoch_accuracy
                 num_batches += 1
                 
-                logger.debug(f"Client {self.client_id}, Epoch {epoch + 1}: "
-                           f"Loss={epoch_loss:.4f}, Accuracy={epoch_accuracy:.4f}")
+                logger.info(f"Client {self.client_id}, Epoch {epoch + 1}/{epochs}: "
+                           f"Loss={epoch_loss:.4f}, Accuracy={epoch_accuracy:.4f}, Batches={epoch_batches}")
+            else:
+                logger.warning(f"Client {self.client_id}, Epoch {epoch + 1}: No batches processed successfully")
+        
+        # Calculate final model checksum
+        final_checksum = sum(torch.sum(p).item() for p in self.model.parameters())
+        logger.info(f"Client {self.client_id}: Training completed, final checksum={final_checksum:.6f}, change={final_checksum - initial_checksum:.6f}")
         
         # Calculate average metrics
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
         avg_accuracy = total_accuracy / num_batches if num_batches > 0 else 0.0
         
         train_metrics = {
             "train_loss": avg_loss,
             "train_accuracy": avg_accuracy,
-            "epochs_completed": epochs
+            "epochs_completed": epochs,
+            "batches_processed": num_batches,
+            "parameter_change": float(final_checksum - initial_checksum)
         }
         
         # Store in history
@@ -241,6 +292,7 @@ class DriftDetectionClient(NumPyClient):
             'metrics': train_metrics
         })
         
+        logger.info(f"Client {self.client_id}: Training metrics: {train_metrics}")
         return train_metrics
     
     def _evaluate_model(self) -> Dict[str, float]:
@@ -253,15 +305,32 @@ class DriftDetectionClient(NumPyClient):
         
         self.model.eval()
         
-        for batch in self.test_loader:
-            metrics = self.trainer.evaluate_step(batch)
-            
-            total_loss += metrics['loss']
-            total_accuracy += metrics['accuracy']
-            num_batches += 1
-            
-            all_predictions.extend(metrics['predictions'])
-            all_labels.extend(metrics['labels'])
+        with torch.no_grad():
+            for batch in self.test_loader:
+                try:
+                    # Move batch to device
+                    input_ids = batch['input_ids'].to(self.device)
+                    attention_mask = batch['attention_mask'].to(self.device)
+                    labels = batch['labels'].to(self.device)
+                    
+                    # Forward pass
+                    logits = self.model(input_ids, attention_mask)
+                    loss = self.model.criterion(logits, labels)
+                    
+                    # Calculate accuracy
+                    predictions = torch.argmax(logits, dim=-1)
+                    correct = (predictions == labels).float().mean()
+                    
+                    total_loss += loss.item()
+                    total_accuracy += correct.item()
+                    num_batches += 1
+                    
+                    all_predictions.extend(predictions.cpu().tolist())
+                    all_labels.extend(labels.cpu().tolist())
+                    
+                except Exception as batch_error:
+                    logger.warning(f"Client {self.client_id}: Batch evaluation failed: {batch_error}")
+                    continue
         
         # Calculate average metrics
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0

@@ -16,16 +16,33 @@ from pathlib import Path
 import json
 import csv
 from datetime import datetime
+import atexit
 
 import flwr as fl
 from flwr.simulation import start_simulation
 from flwr.common import Context
+
+# Import ray for proper cleanup
+try:
+    import ray
+    RAY_AVAILABLE = True
+    
+    # Register Ray cleanup handler
+    def cleanup_ray():
+        if ray.is_initialized():
+            ray.shutdown()
+    
+    atexit.register(cleanup_ray)
+    
+except ImportError:
+    RAY_AVAILABLE = False
 
 from .data import FederatedDataLoader, MODEL_CONFIG, DRIFT_CONFIG, FEDERATED_CONFIG
 from .models import create_model, get_device
 from .client import create_drift_detection_client
 from .server import create_drift_aware_strategy
 from .drift_detection import calculate_drift_metrics, visualize_drift_timeline
+from .metrics_utils import find_stabilization_point
 
 # Configure logging
 logging.basicConfig(
@@ -275,6 +292,11 @@ class FederatedDriftSimulation:
         }
         
         try:
+            # Ensure Ray is properly cleaned up from any previous runs
+            if RAY_AVAILABLE and ray.is_initialized():
+                logger.info("Shutting down existing Ray session...")
+                ray.shutdown()
+            
             # Create proper Flower config with num_rounds
             config = fl.server.ServerConfig(num_rounds=self.num_rounds)
 
@@ -301,6 +323,11 @@ class FederatedDriftSimulation:
         except Exception as e:
             logger.error(f"Simulation failed: {e}")
             raise e
+        finally:
+            # Ensure Ray is properly shutdown after simulation
+            if RAY_AVAILABLE and ray.is_initialized():
+                logger.info("Cleaning up Ray resources...")
+                ray.shutdown()
     
     def _analyze_results(self, history: Any, strategy: Any) -> Dict[str, Any]:
         """Analyze simulation results."""
@@ -312,17 +339,25 @@ class FederatedDriftSimulation:
             'timestamp': datetime.now().isoformat()
         }
         
-        # Extract training history
+        # Extract training history from multiple possible sources
         if hasattr(history, 'losses_distributed'):
             results['training_losses'] = history.losses_distributed
         
+        if hasattr(history, 'metrics_distributed') and history.metrics_distributed:
+            # Handle both fit and evaluate metrics from distributed
+            if 'fit' in history.metrics_distributed:
+                results['training_metrics'] = history.metrics_distributed['fit']
+            if 'evaluate' in history.metrics_distributed:
+                results['evaluation_metrics'] = history.metrics_distributed['evaluate']
+        
+        # Fallback to older attribute names for compatibility
         if hasattr(history, 'metrics_distributed_fit'):
             results['training_metrics'] = history.metrics_distributed_fit
         
         if hasattr(history, 'losses_centralized'):
             results['evaluation_losses'] = history.losses_centralized
         
-        if hasattr(history, 'metrics_centralized'):
+        if hasattr(history, 'metrics_centralized') and history.metrics_centralized:
             results['evaluation_metrics'] = history.metrics_centralized
         
         # Get drift detection summary from strategy
@@ -337,8 +372,12 @@ class FederatedDriftSimulation:
             )
             results['drift_metrics'] = drift_metrics
         
-        # Calculate performance metrics
-        results['performance_metrics'] = self._calculate_performance_metrics(history)
+        # Calculate performance metrics with fallback
+        try:
+            results['performance_metrics'] = self._calculate_performance_metrics(history)
+        except Exception as e:
+            logger.warning(f"Performance metrics calculation failed, using fallback: {e}")
+            results['performance_metrics'] = self._calculate_fallback_metrics(strategy)
         
         logger.info("Results analysis completed")
         return results
@@ -348,16 +387,38 @@ class FederatedDriftSimulation:
         metrics = {}
         
         try:
-            # Extract accuracy data
-            if hasattr(history, 'metrics_centralized'):
-                accuracies = []
-                fairness_gaps = []
+            # Extract accuracy data from distributed evaluation metrics
+            accuracies = []
+            fairness_gaps = []
+            
+            # Check multiple possible locations for metrics
+            evaluation_metrics = None
+            
+            # Try metrics_distributed first (this is where Flower actually stores them)
+            if hasattr(history, 'metrics_distributed') and history.metrics_distributed:
+                if 'evaluate' in history.metrics_distributed:
+                    evaluation_metrics = history.metrics_distributed['evaluate']
+                    logger.info(f"Found distributed evaluation metrics: {len(evaluation_metrics)} rounds")
+            
+            # Fallback to metrics_centralized if available
+            elif hasattr(history, 'metrics_centralized') and history.metrics_centralized:
+                evaluation_metrics = history.metrics_centralized
+                logger.info(f"Found centralized evaluation metrics: {len(evaluation_metrics)} rounds")
+            
+            # Extract metrics from either source
+            if evaluation_metrics:
+                for round_data in evaluation_metrics:
+                    if isinstance(round_data, (list, tuple)) and len(round_data) >= 2:
+                        round_num, round_metrics = round_data[0], round_data[1]
+                        
+                        if isinstance(round_metrics, dict):
+                            if 'global_accuracy' in round_metrics:
+                                accuracies.append(float(round_metrics['global_accuracy']))
+                            if 'fairness_gap' in round_metrics:
+                                fairness_gaps.append(float(round_metrics['fairness_gap']))
                 
-                for round_metrics in history.metrics_centralized:
-                    if 'global_accuracy' in round_metrics[1]:
-                        accuracies.append(round_metrics[1]['global_accuracy'])
-                    if 'fairness_gap' in round_metrics[1]:
-                        fairness_gaps.append(round_metrics[1]['fairness_gap'])
+                logger.info(f"Extracted {len(accuracies)} accuracy values: {accuracies}")
+                logger.info(f"Extracted {len(fairness_gaps)} fairness gap values: {fairness_gaps}")
                 
                 if accuracies:
                     metrics.update({
@@ -374,17 +435,204 @@ class FederatedDriftSimulation:
                         'avg_fairness_gap': np.mean(fairness_gaps)
                     })
                 
-                # Calculate recovery metrics if drift was injected
+                # Calculate comprehensive recovery metrics if drift was injected
                 if len(accuracies) > self.drift_injection_round:
-                    pre_drift_acc = np.mean(accuracies[:self.drift_injection_round])
-                    post_drift_acc = accuracies[-1]
-                    
-                    metrics['pre_drift_accuracy'] = pre_drift_acc
-                    metrics['post_drift_accuracy'] = post_drift_acc
-                    metrics['accuracy_recovery_rate'] = post_drift_acc / pre_drift_acc if pre_drift_acc > 0 else 0.0
+                    recovery_metrics = self._calculate_recovery_metrics(accuracies)
+                    metrics.update(recovery_metrics)
+            else:
+                logger.warning("No evaluation metrics found in history object")
+                # Debug: log available attributes
+                logger.info(f"Available history attributes: {[attr for attr in dir(history) if not attr.startswith('_')]}")
         
         except Exception as e:
             logger.warning(f"Failed to calculate some performance metrics: {e}")
+            import traceback
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
+        
+        return metrics
+
+    def _calculate_recovery_metrics(
+        self,
+        accuracies: List[float],
+        mitigation_start_round: int = None
+    ) -> Dict[str, Any]:
+        """
+        Calculate comprehensive recovery metrics following academic standards.
+
+        Analyzes the recovery process after drift detection and mitigation activation,
+        measuring speed, completeness, and quality of recovery.
+
+        Metrics Calculated:
+            - pre_drift_accuracy: Baseline accuracy before drift injection
+            - at_drift_accuracy: Accuracy at drift injection round
+            - post_recovery_accuracy: Final accuracy after recovery
+            - recovery_speed_rounds: Rounds until stabilization
+            - recovery_completeness: % of lost performance restored
+            - recovery_quality_score: Combined metric (completeness * (1 / speed))
+            - overshoot: If recovery exceeds pre-drift baseline
+            - undershoot: If recovery falls short of baseline
+            - stability_post_recovery: Std of accuracy after stabilization
+            - full_recovery_achieved: Boolean flag
+
+        Args:
+            accuracies: List of global accuracy values across all rounds
+            mitigation_start_round: Round when mitigation started (auto-detected if None)
+
+        Returns:
+            Dictionary with comprehensive recovery metrics
+        """
+        metrics = {}
+
+        # Validate inputs
+        if not accuracies or len(accuracies) <= self.drift_injection_round:
+            logger.warning("Insufficient data for recovery metrics calculation")
+            return metrics
+
+        # Step 1: Calculate pre-drift baseline (average before drift injection)
+        pre_drift_window = accuracies[:self.drift_injection_round]
+        pre_drift_accuracy = float(np.mean(pre_drift_window))
+        pre_drift_std = float(np.std(pre_drift_window))
+
+        # Step 2: Measure drift impact (accuracy at injection round)
+        at_drift_accuracy = float(accuracies[self.drift_injection_round])
+
+        # Step 3: Detect mitigation start (if not provided)
+        if mitigation_start_round is None:
+            # Auto-detect: look for first improvement after drift
+            mitigation_start_round = self.drift_injection_round
+            for i in range(self.drift_injection_round + 1, len(accuracies)):
+                if accuracies[i] > at_drift_accuracy:
+                    mitigation_start_round = i
+                    logger.debug(f"Auto-detected mitigation start at round {i}")
+                    break
+
+        # Step 4: Find stabilization point using window-based approach
+        # Look for point where accuracy changes become minimal
+        stabilization_threshold = 0.01  # 1% change threshold
+        stabilization_window = 3  # Must be stable for 3 consecutive rounds
+
+        stabilization_round = find_stabilization_point(
+            values=accuracies,
+            start_index=mitigation_start_round,
+            threshold=stabilization_threshold,
+            window_size=stabilization_window
+        )
+
+        # Step 5: Calculate recovery metrics
+        post_recovery_accuracy = float(accuracies[stabilization_round])
+        recovery_speed_rounds = stabilization_round - self.drift_injection_round
+
+        # Calculate completeness: % of lost performance restored
+        # Formula: (recovered - at_drift) / (pre_drift - at_drift)
+        performance_lost = pre_drift_accuracy - at_drift_accuracy
+        performance_recovered = post_recovery_accuracy - at_drift_accuracy
+
+        if performance_lost > 0:
+            recovery_completeness = performance_recovered / performance_lost
+        else:
+            # No performance lost, or accuracy increased at drift
+            recovery_completeness = 1.0 if post_recovery_accuracy >= pre_drift_accuracy else 0.0
+
+        # Clamp completeness to [0, inf) - can exceed 1.0 if overshoot occurs
+        recovery_completeness = max(0.0, recovery_completeness)
+
+        # Calculate recovery quality score (combines completeness and speed)
+        # Higher completeness and lower speed = better quality
+        # Formula: completeness * (1 / normalized_speed)
+        max_rounds = len(accuracies)
+        normalized_speed = recovery_speed_rounds / max_rounds  # Normalize to [0, 1]
+        speed_factor = 1.0 / (normalized_speed + 0.1)  # Add 0.1 to avoid division by zero
+
+        recovery_quality_score = recovery_completeness * speed_factor
+
+        # Calculate overshoot and undershoot
+        overshoot = max(0.0, post_recovery_accuracy - pre_drift_accuracy)
+        undershoot = max(0.0, pre_drift_accuracy - post_recovery_accuracy)
+
+        # Calculate stability after recovery
+        post_stabilization_window = accuracies[stabilization_round:]
+        stability_post_recovery = (
+            float(np.std(post_stabilization_window))
+            if len(post_stabilization_window) > 1
+            else 0.0
+        )
+
+        # Determine if full recovery was achieved
+        recovery_tolerance = 0.02  # Within 2% of baseline
+        full_recovery_achieved = abs(post_recovery_accuracy - pre_drift_accuracy) <= recovery_tolerance
+
+        # Step 6: Package all metrics
+        metrics.update({
+            # Baseline measurements
+            'pre_drift_accuracy': pre_drift_accuracy,
+            'pre_drift_std': pre_drift_std,
+            'at_drift_accuracy': at_drift_accuracy,
+            'post_recovery_accuracy': post_recovery_accuracy,
+
+            # Recovery measurements
+            'recovery_speed_rounds': recovery_speed_rounds,
+            'recovery_completeness': recovery_completeness,
+            'recovery_quality_score': recovery_quality_score,
+
+            # Additional metrics
+            'overshoot': overshoot,
+            'undershoot': undershoot,
+            'stability_post_recovery': stability_post_recovery,
+
+            # Analysis flags
+            'full_recovery_achieved': full_recovery_achieved,
+            'stabilization_round': stabilization_round,
+            'mitigation_start_round': mitigation_start_round,
+
+            # Performance changes
+            'performance_lost': performance_lost,
+            'performance_recovered': performance_recovered,
+
+            # Legacy metric (for backward compatibility)
+            'accuracy_recovery_rate': post_recovery_accuracy / pre_drift_accuracy if pre_drift_accuracy > 0 else 0.0
+        })
+
+        logger.info(
+            f"Recovery analysis: "
+            f"Completeness={recovery_completeness:.2%}, "
+            f"Speed={recovery_speed_rounds} rounds, "
+            f"Quality={recovery_quality_score:.3f}, "
+            f"Full recovery={'Yes' if full_recovery_achieved else 'No'}"
+        )
+
+        return metrics
+
+    def _calculate_fallback_metrics(self, strategy: Any) -> Dict[str, float]:
+        """Calculate performance metrics using strategy's performance history as fallback."""
+        metrics = {}
+        
+        try:
+            # Try to extract from strategy's performance history
+            if hasattr(strategy, 'performance_history') and strategy.performance_history:
+                accuracies = [p['global_accuracy'] for p in strategy.performance_history]
+                fairness_gaps = [p['fairness_gap'] for p in strategy.performance_history]
+                
+                if accuracies:
+                    metrics.update({
+                        'final_accuracy': accuracies[-1],
+                        'peak_accuracy': max(accuracies),
+                        'avg_accuracy': np.mean(accuracies),
+                        'accuracy_std': np.std(accuracies)
+                    })
+                
+                if fairness_gaps:
+                    metrics.update({
+                        'final_fairness_gap': fairness_gaps[-1],
+                        'max_fairness_gap': max(fairness_gaps),
+                        'avg_fairness_gap': np.mean(fairness_gaps)
+                    })
+                
+                logger.info(f"Fallback metrics extracted: {len(accuracies)} accuracy values")
+            else:
+                logger.warning("No fallback performance history available")
+                
+        except Exception as e:
+            logger.error(f"Fallback metrics calculation also failed: {e}")
         
         return metrics
     
@@ -446,27 +694,46 @@ def main():
     try:
         results = simulation.run_simulation()
         
-        # Print summary
-        print("\n" + "="*50)
-        print("SIMULATION SUMMARY")
-        print("="*50)
-        print(f"Simulation ID: {results['simulation_id']}")
+        # Print enhanced summary with better error handling
+        print("\n" + "="*60)
+        print("🎯 SIMULATION COMPLETED SUCCESSFULLY")
+        print("="*60)
         
-        if 'performance_metrics' in results:
+        # Performance metrics with safe formatting
+        if 'performance_metrics' in results and results['performance_metrics']:
             metrics = results['performance_metrics']
-            print(f"Final Accuracy: {metrics.get('final_accuracy', 'N/A'):.4f}")
-            print(f"Peak Accuracy: {metrics.get('peak_accuracy', 'N/A'):.4f}")
-            print(f"Fairness Gap: {metrics.get('final_fairness_gap', 'N/A'):.4f}")
+            final_acc = metrics.get('final_accuracy')
+            peak_acc = metrics.get('peak_accuracy')
+            fairness_gap = metrics.get('final_fairness_gap')
+            recovery_rate = metrics.get('accuracy_recovery_rate')
             
-            if 'accuracy_recovery_rate' in metrics:
-                print(f"Recovery Rate: {metrics['accuracy_recovery_rate']:.4f}")
+            print(f"📊 Final Global Accuracy: {final_acc:.4f}" if final_acc is not None else "📊 Final Global Accuracy: N/A")
+            print(f"📈 Peak Accuracy: {peak_acc:.4f}" if peak_acc is not None else "📈 Peak Accuracy: N/A")
+            print(f"⚖️  Fairness Gap: {fairness_gap:.4f}" if fairness_gap is not None else "⚖️  Fairness Gap: N/A")
+            
+            if recovery_rate is not None:
+                print(f"🔄 Recovery Rate: {recovery_rate:.4f}")
+        else:
+            print("📊 Final Global Accuracy: N/A")
+            print("📈 Peak Accuracy: N/A")
+            print("⚖️  Fairness Gap: N/A")
         
-        if 'drift_summary' in results:
+        # Drift detection metrics with safe formatting
+        if 'drift_summary' in results and results['drift_summary']:
             drift_summary = results['drift_summary']
-            print(f"Drift Detection Rate: {drift_summary.get('drift_detection_rate', 'N/A'):.4f}")
-            print(f"Mitigation Activated: {drift_summary.get('mitigation_activated', 'N/A')}")
+            detection_rate = drift_summary.get('drift_detection_rate')
+            mitigation_active = drift_summary.get('mitigation_activated')
+            
+            print(f"🔍 Drift Detection Rate: {detection_rate:.4f}" if detection_rate is not None else "🔍 Drift Detection Rate: N/A")
+            print(f"🛡️  Mitigation Activated: {mitigation_active}" if mitigation_active is not None else "🛡️  Mitigation Activated: N/A")
+        else:
+            print("🔍 Drift Detection Rate: N/A")
+            print("🛡️  Mitigation Activated: N/A")
         
-        print("="*50)
+        # Results location
+        json_file = f"results/simulation_{results['simulation_id']}.json"
+        print(f"💾 Results saved to: {json_file}")
+        print("="*60)
         
         return results
         

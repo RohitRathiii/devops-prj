@@ -12,7 +12,16 @@ Example:
 import argparse
 import sys
 import logging
+import os
 from pathlib import Path
+
+# Set threading environment variables to prevent mutex locks
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1" 
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["RAY_DISABLE_IMPORT_WARNING"] = "1"
 
 # Add the project root to Python path
 project_root = Path(__file__).parent

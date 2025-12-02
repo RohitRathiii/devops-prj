@@ -19,6 +19,13 @@ from flwr.server.client_proxy import ClientProxy
 import logging
 
 from .drift_detection import MMDDriftDetector, DriftResult, MultiLevelDriftDetector
+from .metrics_utils import (
+    calculate_gini_coefficient,
+    calculate_weighted_mean,
+    calculate_fairness_variance,
+    calculate_fairness_std,
+    calculate_equalized_accuracy
+)
 
 logger = logging.getLogger(__name__)
 
@@ -273,40 +280,104 @@ class DriftAwareFedAvg(FedAvg):
         # Standard aggregation
         aggregated_loss, base_metrics = super().aggregate_evaluate(server_round, results, failures)
         
-        # Extract performance metrics
+        # Extract performance metrics with detailed logging
         accuracies = []
         losses = []
+        client_metrics = {}
+        
+        logger.info(f"Server Round {server_round}: Processing {len(results)} evaluation results")
         
         for client_proxy, evaluate_res in results:
             losses.append(evaluate_res.loss)
-            if hasattr(evaluate_res, 'metrics') and 'accuracy' in evaluate_res.metrics:
-                accuracies.append(evaluate_res.metrics['accuracy'])
+            
+            # Extract client metrics with logging
+            if hasattr(evaluate_res, 'metrics') and evaluate_res.metrics:
+                client_id = getattr(client_proxy, 'cid', 'unknown')
+                client_metrics[client_id] = evaluate_res.metrics
+                
+                if 'accuracy' in evaluate_res.metrics:
+                    accuracies.append(evaluate_res.metrics['accuracy'])
+                    logger.debug(f"Client {client_id}: Accuracy={evaluate_res.metrics['accuracy']:.4f}, Loss={evaluate_res.loss:.4f}")
+                else:
+                    logger.warning(f"Client {client_id}: No accuracy in metrics: {list(evaluate_res.metrics.keys())}")
+            else:
+                logger.warning(f"Client {getattr(client_proxy, 'cid', 'unknown')}: No metrics in evaluation result")
         
-        # Calculate fairness metrics
-        global_accuracy = np.mean(accuracies) if accuracies else 0.0
-        fairness_gap = np.max(accuracies) - np.min(accuracies) if len(accuracies) > 1 else 0.0
-        
-        # Update performance history
+        # Calculate fairness metrics with validation
+        if accuracies:
+            # Extract sample sizes for weighted global accuracy
+            sample_sizes = [evaluate_res.num_examples for _, evaluate_res in results]
+
+            # FIX CRITICAL BUG: Use weighted mean instead of unweighted mean
+            global_accuracy = calculate_weighted_mean(accuracies, sample_sizes)
+
+            # Calculate comprehensive fairness metrics
+            fairness_gap = np.max(accuracies) - np.min(accuracies) if len(accuracies) > 1 else 0.0
+            fairness_variance = calculate_fairness_variance(accuracies)
+            fairness_std = calculate_fairness_std(accuracies)
+            fairness_gini = calculate_gini_coefficient(accuracies)
+            equalized_accuracy = calculate_equalized_accuracy(accuracies, global_accuracy)
+
+            # Additional statistical metrics
+            min_accuracy = float(np.min(accuracies))
+            max_accuracy = float(np.max(accuracies))
+            median_accuracy = float(np.median(accuracies))
+
+            logger.info(
+                f"Server Round {server_round}: "
+                f"Global accuracy={global_accuracy:.4f} (weighted), "
+                f"Fairness gap={fairness_gap:.4f}, "
+                f"Gini={fairness_gini:.4f}, "
+                f"Std={fairness_std:.4f}"
+            )
+        else:
+            # No accuracies collected - set all metrics to 0
+            global_accuracy = 0.0
+            fairness_gap = 0.0
+            fairness_variance = 0.0
+            fairness_std = 0.0
+            fairness_gini = 0.0
+            equalized_accuracy = 0.0
+            min_accuracy = 0.0
+            max_accuracy = 0.0
+            median_accuracy = 0.0
+            logger.warning(f"Server Round {server_round}: No accuracies collected from clients")
+
+        # Update performance history with comprehensive metrics
         self.performance_history.append({
             'round': server_round,
             'global_accuracy': global_accuracy,
             'global_loss': aggregated_loss or 0.0,
             'fairness_gap': fairness_gap,
+            'fairness_variance': fairness_variance,
+            'fairness_std': fairness_std,
+            'fairness_gini': fairness_gini,
+            'equalized_accuracy': equalized_accuracy,
+            'min_accuracy': min_accuracy,
+            'max_accuracy': max_accuracy,
+            'median_accuracy': median_accuracy,
             'client_accuracies': accuracies,
             'client_losses': losses
         })
-        
-        # Enhanced metrics
+
+        # Enhanced metrics with comprehensive fairness measurements
         enhanced_metrics = {
             "global_accuracy": global_accuracy,
             "fairness_gap": fairness_gap,
+            "fairness_variance": fairness_variance,
+            "fairness_std": fairness_std,
+            "fairness_gini": fairness_gini,
+            "equalized_accuracy": equalized_accuracy,
+            "min_accuracy": min_accuracy,
+            "max_accuracy": max_accuracy,
+            "median_accuracy": median_accuracy,
             "num_clients_evaluated": len(results),
             "mitigation_active": self.mitigation_active
         }
-        
+
         if base_metrics:
             enhanced_metrics.update(base_metrics)
-        
+
         return aggregated_loss, enhanced_metrics
     
     def _detect_global_drift(self, server_round: int, client_embeddings: List[Any]) -> DriftResult:
